@@ -19,5 +19,5 @@ COPY migrations ./migrations
 # ne pas tourner en root
 USER node
 
-EXPOSE 3000
+EXPOSE 4000
 CMD ["node", "src/server.js"]

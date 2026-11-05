@@ -1,108 +1,104 @@
-# TP8 — API Express sécurisée et testée
+# TP9 — Pipeline as Code avec Jenkins
 
-Zod, Helmet, rate limiting, Vitest, Supertest, PostgreSQL et migrations.
+Jenkinsfile, agents Docker, exécution parallèle, JUnit, credentials, image tagguée avec le Git SHA et Multibranch Pipeline.
 
-Une petite API de formulaire de contact (`POST /api/contact`), volontairement fragile au départ, rendue robuste puis couverte par des tests automatisés.
+Projet utilisé : l'API `contact-api` du TP8 (Express, Zod, Helmet, Vitest). Le README du TP8 est conservé dans [README-TP8.md](README-TP8.md).
 
-## Lancer le projet
+- Jenkins : `http://192.168.190.141:8080` (VM de lab)
+- Image Docker Hub : [`hablani/contact-api`](https://hub.docker.com/r/hablani/contact-api/tags)
+- Pipeline : [`Jenkinsfile`](Jenkinsfile)
 
-```bash
-npm install
-cp .env.example .env              # puis changer PGPASSWORD
-set -a; . ./.env; set +a
-docker compose up -d --wait       # PostgreSQL 17
-npm run migrate                   # applique migrations/*.sql (idempotent)
-npm test                          # tests de routes (sans base)
-npm run test:coverage             # couverture
-npm run test:integration          # tests contre PostgreSQL
-npm start                         # API sur http://localhost:4000
+## Pipeline
+
+```
+Checkout → Install → Quality ( Lint ∥ Unit tests ) → Build → Push (main uniquement) → post
 ```
 
-## Partie 1 — OWASP API Security Top 10 (2023)
-
-| Risque OWASP | Concerne notre API ? | Mesure dans ce TP |
+| Stage | Agent | Rôle |
 |---|---|---|
-| API1 Broken Object Level Authorization | Non pour l'instant : aucune route ne lit un objet par son id. Oui dès qu'on ajoute `GET /api/contact/:id` | À prévoir : authentification + contrôle que l'utilisateur a le droit de lire cet objet |
-| API2 Broken Authentication | Non : formulaire public, sans compte | Hors périmètre ; la route de lecture (défi) devrait être réservée à un administrateur authentifié |
-| API3 Broken Object Property Level Authorization | **Oui** : un client pourrait envoyer `isAdmin: true` (mass assignment) | `.strict()` dans le schéma Zod refuse tout champ en trop, et la route ne transmet que `name`, `email`, `message` au repository |
-| API4 Unrestricted Resource Consumption | **Oui** : rafales de requêtes, corps énormes | Rate limiting 5 req/min/IP sur `/api/contact`, corps JSON limité à 10 ko (413), longueurs max dans Zod |
-| API5 Broken Function Level Authorization | Non : une seule fonction publique | À prévoir si une route d'administration est ajoutée |
-| API6 Unrestricted Access to Sensitive Business Flows | **Oui** : spam du formulaire par des robots | Rate limiting (un CAPTCHA serait l'étape suivante) |
-| API7 Server Side Request Forgery | Non : l'API n'appelle aucune URL fournie par le client | — |
-| API8 Security Misconfiguration | **Oui** : stack trace renvoyée au client, `X-Powered-By: Express`, aucun header de sécurité | Helmet, `app.disable("x-powered-by")`, middleware d'erreur centralisé sans stack trace, 404 JSON |
-| API9 Improper Inventory Management | Faible : une seule version de l'API | Routes documentées dans ce README |
-| API10 Unsafe Consumption of APIs | Non : pas d'API tierce consommée | — |
+| Checkout | nœud Jenkins | checkout SCM, calcul de `SHORT_SHA = GIT_COMMIT.take(7)` |
+| Install | `node:24-alpine` (`reuseNode true`) | `npm ci` |
+| Lint | `node:24-alpine` | `npm run lint` (ESLint flat config) |
+| Unit tests | `node:24-alpine` | Vitest + rapport JUnit `reports/junit.xml` |
+| Build | nœud Jenkins | `docker build` → `hablani/contact-api:<sha>` + label `org.opencontainers.image.revision` |
+| Push | nœud Jenkins | `docker login` / `docker push`, **uniquement sur `main`** |
 
-**Injection SQL** (anciennement API8:2019) : les requêtes du repository sont **paramétrées** (`$1, $2, $3`), la valeur n'est jamais concaténée dans le SQL. Prouvé par un test unitaire et un test d'intégration.
+Options : `timestamps()`, `disableConcurrentBuilds()`, `buildDiscarder` (10 builds), `timeout` 20 min.
 
-### Trois attaques que la version de départ laissait passer
+Blocs `post` : `junit` (always, dans Unit tests), `docker logout` (always, dans Push), message `success` / `failure`, suppression de l'image locale, `cleanWs()` (cleanup).
 
-1. **Fuite d'informations** : un JSON tronqué (`{"name": "Ada",`) renvoyait une erreur 500 avec la **stack trace** complète (chemins des fichiers du serveur, versions des bibliothèques).
-2. **Absence de validation / mass assignment** : un email invalide, un message vide, des types inattendus (`message: 42`) ou un champ `isAdmin: true` étaient transmis tels quels à la base.
-3. **Consommation illimitée** : aucune limite de débit ni de taille, donc un robot pouvait envoyer des milliers de requêtes ou des corps énormes (spam, déni de service). En plus, `X-Powered-By: Express` révélait la technologie utilisée.
+Les tests d'intégration (PostgreSQL) ne sont pas lancés dans le pipeline : `npm test` exclut `tests/integration/**`.
 
-Version de départ : un JSON tronqué renvoie la stack trace au client.
+## Partie 1 — Premier pipeline depuis le dépôt
 
-![Fuite de la stack trace avant correction](captures/fuite-stack-avant.png)
+- `Jenkinsfile` à la racine du dépôt.
+- Job **Pipeline** → *Pipeline script from SCM* → Git → ce dépôt → branche `main` → Script Path `Jenkinsfile`.
+- Lint ajouté : `npm i -D eslint @eslint/js globals` + `npm pkg set scripts.lint="eslint ."` + [`eslint.config.mjs`](eslint.config.mjs).
 
-## Partie 2 — Validation et gestion des erreurs
+![Stages du pipeline](captures/pipeline-stages.png)
 
-- `src/schemas/contact.js` : `name` (trim, 2–100), `email` (format email, ≤ 254), `message` (10–2000), `.strict()`.
-- `src/middlewares/validate.js` : `safeParse`, réponse 400 `{ error: "VALIDATION_ERROR", details: [{ field, message }] }`, puis `req.body` remplacé par les données validées.
-- `src/middlewares/errorHandler.js` : `INVALID_JSON` (400), `PAYLOAD_TOO_LARGE` (413), `INTERNAL_ERROR` (500). La stack trace est journalisée côté serveur (`console.error`), **jamais** envoyée au client.
-- Route 404 JSON `{ "error": "NOT_FOUND" }` déclarée avant le middleware d'erreur.
+## Partie 2 — Agents Docker, parallélisme et rapports
 
-Chaîne de middlewares : `helmet` → `express.json({ limit: "10kb" })` → rate limit → `validate(contactSchema)` → route → 404 → gestionnaire d'erreurs.
+- `Install`, `Lint` et `Unit tests` s'exécutent dans `node:24-alpine` avec `reuseNode true` (même workspace).
+- `Lint` et `Unit tests` sont dans un bloc `parallel`.
+- Rapport JUnit :
+  ```
+  npm test -- --reporter=default --reporter=junit --outputFile.junit=reports/junit.xml
+  ```
+  publié par `junit` dans `post { always }`.
+- `npm_config_cache = '.npm-cache'` : le conteneur tourne avec l'UID de Jenkins (pas root), le cache npm est donc placé dans le workspace.
+- Test en échec volontaire (`tests/echec-tp9.test.js`) : Unit tests rouge, **Build et Push sautés**, bloc `failure` exécuté, test visible dans l'onglet *Tests*. Le test est ensuite supprimé et le build redevient vert.
 
-![Validation 400](captures/validation-400.png)
+![Rapport JUnit](captures/junit-report.png)
 
-## Partie 3 — Durcissement HTTP
+## Partie 3 — Image tagguée avec le Git SHA, credentials et push
 
-- `app.disable("x-powered-by")` et `app.use(helmet())` : ajout de `Content-Security-Policy`, `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`, `Cross-Origin-*`.
-- Corps JSON limité à 10 ko.
-- `express-rate-limit` uniquement sur `/api/contact` : 5 requêtes par minute et par IP, headers standard `RateLimit-Policy: 5;w=60` et `RateLimit: limit=5, remaining=0, reset=32`, réponse `429 { "error": "TOO_MANY_REQUESTS" }`.
-- Derrière un reverse proxy, il faudra activer `app.set("trust proxy", 1)`, sinon toutes les requêtes semblent venir de la même IP (celle du proxy).
+- Credential Jenkins `dockerhub` (*Username with password*) : utilisateur `hablani` + **access token** Docker Hub (Read & Write), pas le mot de passe.
+- Tag de l'image : `hablani/contact-api:<SHORT_SHA>` avec le label `org.opencontainers.image.revision=<GIT_COMMIT>`.
+- Push uniquement sur `main` :
+  ```groovy
+  when { expression { env.BRANCH_NAME == 'main' || env.GIT_BRANCH == 'origin/main' } }
+  ```
+  (`BRANCH_NAME` en Multibranch, `GIT_BRANCH` dans un job Pipeline simple).
+- Commandes `sh` entre **guillemets simples** : c'est le shell qui remplace `$DH_TOKEN`, Groovy n'interpole jamais le secret ; Jenkins l'affiche `****` dans la console.
+- `image.txt` (référence complète de l'image) archivé avec `archiveArtifacts`.
+- Premier build : image `hablani/contact-api:3427f9c`, identique à `git rev-parse --short HEAD`.
 
-![Headers avant / après Helmet](captures/helmet-headers.png)
+![Token masqué](captures/credentials-masked.png)
 
-![Rate limit 429](captures/rate-limit-429.png)
+![Tag SHA sur Docker Hub](captures/dockerhub-sha-tag.png)
 
-## Partie 4 — Tests de routes et cas négatifs
+## Partie 4 — Multibranch Pipeline
 
-14 tests (Vitest + Supertest, repository en mémoire, aucun port ouvert) :
+- Credential GitHub : identifiant + fine-grained personal access token en lecture seule sur le dépôt.
+- Job **Multibranch Pipeline** → source GitHub → ce dépôt → *Periodically if not otherwise run* : **2 minutes** (la VM n'est pas joignable depuis Internet, donc pas de webhook).
+- Branche `feature/rate-limit-config` + Pull Request → jobs `feature/rate-limit-config` et `PR-1` créés automatiquement.
+- Stage **Push sauté** sur la branche et la PR, **exécuté sur `main`** après le merge.
 
-- message valide (201) ;
-- email invalide, champ manquant, champ en trop (`isAdmin`), types inattendus → 400 `VALIDATION_ERROR` ;
-- JSON tronqué → 400 `INVALID_JSON` ;
-- corps de plus de 10 ko → 413 `PAYLOAD_TOO_LARGE` ;
-- nom contenant une injection SQL → stocké tel quel ;
-- erreur 500 (repository qui lève une exception) → `{ "error": "INTERNAL_ERROR" }`, ni stack ni message d'origine, erreur bien journalisée ;
-- headers Helmet présents, `x-powered-by` absent ;
-- 6ᵉ requête → 429 ;
-- route inconnue → 404 JSON.
+![Multibranch](captures/multibranch.png)
 
-![Tests OK](captures/tests-ok.png)
+## Défi — Shared Library
 
-**Couverture** : 100 % sur `app.js`, les middlewares, les routes et le schéma. `server.js`, `migrate.js` et la partie PostgreSQL du repository sont à 0–51 % car les tests de routes utilisent le repository en mémoire : ce code est couvert par les tests d'intégration.
+- `vars/buildAndPush.groovy` dans un dépôt séparé `jenkins-ci-lib`, déclaré dans *Manage Jenkins → System → Global Pipeline Libraries* sous le nom `ci-lib` (version `main`).
+- Chargée dans le Jenkinsfile par `@Library('ci-lib') _`, puis :
+  ```groovy
+  buildAndPush(image: env.IMAGE_NAME, tag: env.SHORT_SHA, push: env.BRANCH_NAME == 'main')
+  ```
 
-![Couverture](captures/coverage.png)
+![Shared Library](captures/shared-library.png)
 
-## Partie 5 — PostgreSQL et migrations
+## Fichiers ajoutés pour le TP9
 
-- `npm run migrate` applique `001_create_contacts.sql` ; une 2ᵉ exécution n'applique rien (**idempotent**).
-- Ajout de `002_add_contacts_email_index.sql` : `CREATE INDEX IF NOT EXISTS contacts_email_idx ON contacts (email);`
-- `tests/integration/contact.int.test.js` (3 tests) :
-  - un contact envoyé par l'API est retrouvé en base par une requête SQL ;
-  - une injection SQL dans `name` est stockée telle quelle et la table `contacts` existe toujours ;
-  - l'index de la migration 002 existe.
-
-![Intégration OK](captures/integration-ok.png)
-
-Tests manuels avec `curl` sur l'API démarrée : requête valide → `201 {"id":8}`, requête invalide → `400 VALIDATION_ERROR`, injection `x'); DROP TABLE contacts;--` → `201 {"id":9}`, la table est intacte.
-
-![Tests manuels](captures/tests-manuels.png)
+| Fichier | Rôle |
+|---|---|
+| `Jenkinsfile` | pipeline déclaratif final |
+| `Dockerfile` | build multi-stage, utilisateur `node`, port 4000 |
+| `.dockerignore` | exclut tests, `.env`, `node_modules`, captures… |
+| `eslint.config.mjs` | configuration ESLint (ESM, globals Node) |
+| `captures/` | captures d'écran des livrables |
 
 ## Adaptations à l'environnement
 
-- Port 4000 déjà utilisé par un conteneur d'un autre TP : conteneur arrêté pendant le TP.
-- Node.js 22 sur la VM (au lieu de 24) : aucun impact, tous les tests passent.
+- Jenkins et Docker sur la même VM : `sudo usermod -aG docker jenkins && sudo systemctl restart jenkins`.
+- Interface Jenkins en français : *Administrer Jenkins → Credentials → System → Global credentials*.
+- Scan périodique du Multibranch à la place du webhook GitHub.
